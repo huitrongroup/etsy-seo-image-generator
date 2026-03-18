@@ -1,61 +1,127 @@
-from dataclasses import dataclass
-from typing import Callable
-from models import ContentRequest, Season
+"""
+Hard rules for Etsy SEO output:
+- Banned words that must never appear in titles or tags
+- Length limits (Etsy platform constraints)
+- Root-word repetition detection (anti-stuffing)
+"""
+
+from __future__ import annotations
+
+import re
+
+# ---------------------------------------------------------------------------
+# Platform limits
+# ---------------------------------------------------------------------------
+
+ETSY_TITLE_MAX = 140
+ETSY_TAG_MAX = 20
+ETSY_TAG_COUNT = 13
+ETSY_TITLE_COUNT = 5
+
+# ---------------------------------------------------------------------------
+# Banned words (must never appear in generated output)
+# ---------------------------------------------------------------------------
+
+BANNED_WORDS: frozenset[str] = frozenset({
+    "funny",
+    "cute",
+    "sentimental",
+    "quote",
+    "unique",
+    "perfect",
+    "awesome",
+    "gift idea",
+    "trendy",
+    "aesthetic",
+})
+
+# ---------------------------------------------------------------------------
+# Banned-word checking
+# ---------------------------------------------------------------------------
+
+def find_banned_words(text: str) -> list[str]:
+    """Return any banned words/phrases found in `text` (case-insensitive, whole-word)."""
+    text_lower = text.lower()
+    found: list[str] = []
+    for word in BANNED_WORDS:
+        # Multi-word banned phrases need a simple substring check
+        if " " in word:
+            if word in text_lower:
+                found.append(word)
+        else:
+            if re.search(r"\b" + re.escape(word) + r"\b", text_lower):
+                found.append(word)
+    return found
 
 
-@dataclass
-class Rule:
-    name: str
-    description: str
-    check: Callable[[str, ContentRequest], list[str]]
+# ---------------------------------------------------------------------------
+# Root-word repetition (anti-stuffing)
+# ---------------------------------------------------------------------------
+
+# Common suffixes to strip for basic stemming
+_SUFFIXES = ("ing", "tion", "ness", "ment", "ful", "less", "ers", "er", "ed", "es", "ly", "s")
 
 
-def check_length(text: str, req: ContentRequest) -> list[str]:
-    if len(text) > req.max_length:
-        return [f"Content exceeds max length ({len(text)} > {req.max_length} chars)"]
-    return []
+def _stem(word: str) -> str:
+    for suffix in _SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
 
 
-def check_no_competitor_mentions(text: str, req: ContentRequest) -> list[str]:
-    # Placeholder — populate with actual competitor names via config
-    competitors: list[str] = []
-    found = [c for c in competitors if c.lower() in text.lower()]
-    return [f"Competitor mentioned: {c}" for c in found]
+def get_root_counts(text: str) -> dict[str, int]:
+    """Map each stemmed root to how many times it appears in `text`."""
+    words = re.findall(r"\b[a-z]{3,}\b", text.lower())
+    # Skip very common stop-words that inflate counts meaninglessly
+    stop = {"for", "and", "the", "with", "from", "gift", "your", "that", "this", "has", "are"}
+    counts: dict[str, int] = {}
+    for w in words:
+        if w in stop:
+            continue
+        root = _stem(w)
+        counts[root] = counts.get(root, 0) + 1
+    return counts
 
 
-def check_seasonal_fit(text: str, req: ContentRequest) -> list[str]:
-    from seasonal import score_seasonal_relevance
-    score = score_seasonal_relevance(text, req.season)
-    if score < 0.1:
-        return [f"Content lacks seasonal relevance for {req.season.value}"]
-    return []
+def detect_root_repetition(title: str, threshold: int = 2) -> list[str]:
+    """Return root words that appear more than `threshold` times in one title."""
+    return [r for r, n in get_root_counts(title).items() if n > threshold]
 
 
-def check_no_offensive_language(text: str, req: ContentRequest) -> list[str]:
-    flagged = ["hate", "offensive_placeholder"]  # extend as needed
-    found = [w for w in flagged if w in text.lower()]
-    return [f"Potentially offensive term: '{w}'" for w in found]
+# ---------------------------------------------------------------------------
+# Per-item validators
+# ---------------------------------------------------------------------------
+
+def validate_title(title: str) -> list[str]:
+    issues: list[str] = []
+    if len(title) > ETSY_TITLE_MAX:
+        issues.append(f"Too long: {len(title)} chars (max {ETSY_TITLE_MAX})")
+    banned = find_banned_words(title)
+    if banned:
+        issues.append(f"Banned words: {', '.join(banned)}")
+    repeated = detect_root_repetition(title)
+    if repeated:
+        issues.append(f"Root words repeated >2x: {', '.join(repeated)}")
+    return issues
 
 
-def check_cta_present(text: str, req: ContentRequest) -> list[str]:
-    cta_phrases = ["buy now", "learn more", "get started", "shop", "sign up", "click here", "discover"]
-    if not any(phrase in text.lower() for phrase in cta_phrases):
-        return ["No call-to-action detected"]
-    return []
+def validate_tag(tag: str) -> list[str]:
+    issues: list[str] = []
+    if len(tag) > ETSY_TAG_MAX:
+        issues.append(f"Too long: {len(tag)} chars (max {ETSY_TAG_MAX})")
+    banned = find_banned_words(tag)
+    if banned:
+        issues.append(f"Banned words: {', '.join(banned)}")
+    return issues
 
 
-DEFAULT_RULES: list[Rule] = [
-    Rule("length", "Content must not exceed max length", check_length),
-    Rule("seasonal_fit", "Content should be seasonally relevant", check_seasonal_fit),
-    Rule("no_offensive", "Content must not contain offensive language", check_no_offensive_language),
-    Rule("cta", "Content should include a call-to-action", check_cta_present),
-    Rule("no_competitors", "Content must not mention competitors", check_no_competitor_mentions),
-]
+# ---------------------------------------------------------------------------
+# Sanitization helpers (use only as last resort — prefer correct generation)
+# ---------------------------------------------------------------------------
+
+def sanitize_title(title: str) -> str:
+    return title.strip()[:ETSY_TITLE_MAX]
 
 
-def apply_rules(text: str, req: ContentRequest, rules: list[Rule] | None = None) -> list[str]:
-    active_rules = rules if rules is not None else DEFAULT_RULES
-    violations: list[str] = []
-    for rule in active_rules:
-        violations.extend(rule.check(text, req))
-    return violations
+def sanitize_tag(tag: str) -> str:
+    return tag.strip().lower()[:ETSY_TAG_MAX]
